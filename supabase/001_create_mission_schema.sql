@@ -68,6 +68,9 @@ create table if not exists hangman_state (
   updated_at timestamptz not null default now()
 );
 
+alter table hangman_state
+  add column if not exists pending_incorrect_letter text;
+
 create table if not exists hangman_events (
   id uuid primary key default gen_random_uuid(),
   mission_id uuid not null references missions(id) on delete cascade,

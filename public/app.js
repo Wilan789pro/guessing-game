@@ -1,5 +1,5 @@
 import { supabase } from './supabase-client.js';
-import { MISSION_ANSWER, HINTS, normalizeText, isCorrectGuess, isPartialGuess, getGuessOutcome, getNoScale, getNoReaction, getHangmanWordState, getSecurityStatus, revealLettersForGuess, createHangmanState } from '../lib/missionLogic.js';
+import { MISSION_ANSWER, HINTS, normalizeText, isCorrectGuess, isPartialGuess, getGuessOutcome, getNoScale, getNoReaction, getHangmanWordState, revealLettersForGuess, createHangmanState } from '../lib/missionLogic.js';
 
 const STORAGE_KEY = 'agent-prism-mission-state-v1';
 const HIDDEN_HANGMAN_THRESHOLD = 10;
@@ -99,14 +99,132 @@ function persistState() {
 
 function pushEvent(type, payload = {}) {
   state.eventLog = state.eventLog || [];
-  state.eventLog.unshift({
+  const event = {
     id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     type,
     time: new Date().toISOString(),
     payload,
-  });
+  };
+  state.eventLog.unshift(event);
   if (state.eventLog.length > 150) state.eventLog.length = 150;
   persistState();
+  return event;
+}
+
+function snapshotHangman() {
+  return JSON.parse(JSON.stringify(state.defs.hangman));
+}
+
+function recordHangmanEvent(type, payload) {
+  const event = pushEvent(type, payload);
+  state.defs.hangmanSyncQueue = state.defs.hangmanSyncQueue || [];
+  state.defs.hangmanSyncQueue.push({ id: event.id, type, payload, createdAt: event.time });
+  persistState();
+  void flushHangmanSyncQueue();
+}
+
+let hangmanSyncInProgress = false;
+let hangmanSyncUnavailable = false;
+
+async function ensureHangmanRemoteMission() {
+  if (!supabase) return null;
+
+  let { data: authData, error } = await supabase.auth.getSession();
+  if (error) throw error;
+
+  if (!authData.session) {
+    const result = await supabase.auth.signInAnonymously();
+    if (result.error) throw result.error;
+    authData = result.data;
+  }
+
+  if (state.defs.supabaseMissionId) return state.defs.supabaseMissionId;
+
+  let { data: mission, error: missionError } = await supabase
+    .from('missions')
+    .insert({
+      session_token: state.missionId,
+      current_scene: 'hangman',
+      mission_accepted: Boolean(state.missionAccepted),
+      mission_accepted_at: state.missionAcceptedAt,
+    })
+    .select('id')
+    .single();
+
+  if (missionError?.code === '23505') {
+    const existing = await supabase
+      .from('missions')
+      .select('id')
+      .eq('session_token', state.missionId)
+      .single();
+    mission = existing.data;
+    missionError = existing.error;
+  }
+
+  if (missionError) throw missionError;
+  state.defs.supabaseMissionId = mission.id;
+  persistState();
+  return mission.id;
+}
+
+async function flushHangmanSyncQueue() {
+  if (!supabase || hangmanSyncUnavailable || hangmanSyncInProgress) return;
+  const queue = state.defs.hangmanSyncQueue || [];
+  if (!queue.length) return;
+
+  hangmanSyncInProgress = true;
+  try {
+    const missionId = await ensureHangmanRemoteMission();
+    while (state.defs.hangmanSyncQueue?.length) {
+      const event = state.defs.hangmanSyncQueue[0];
+      const hangman = state.defs.hangman;
+      const payload = event.payload || {};
+      const after = payload.stateAfter || hangman;
+      const stateRow = {
+        mission_id: missionId,
+        phrase: after.phrase,
+        revealed_letters: after.revealedLetters || [],
+        selected_letters: after.selectedLetters || [],
+        incorrect_letters: after.incorrectLetters || [],
+        pending_incorrect_letter: after.pendingIncorrectLetter || null,
+        lives: after.lives,
+        max_lives: after.maxLives,
+        save_count: after.saveCount || 0,
+        status: after.status || 'active',
+      };
+      const { error: stateError } = await supabase.from('hangman_state').upsert(stateRow, { onConflict: 'mission_id' });
+      if (stateError) throw stateError;
+
+      const letterEvent = {
+        mission_id: missionId,
+        event_type: event.type,
+        selected_letter: payload.selectedLetter || payload.incorrectLetter || null,
+        correct: typeof payload.correct === 'boolean' ? payload.correct : null,
+        lives_before: payload.stateBefore?.lives ?? payload.livesBefore ?? after.lives,
+        lives_after: payload.stateAfter?.lives ?? payload.livesAfter ?? after.lives,
+        revealed_state: after.revealedLetters || [],
+        idempotency_key: event.id,
+      };
+      const { error: hangmanEventError } = await supabase.from('hangman_events').insert(letterEvent);
+      if (hangmanEventError && hangmanEventError.code !== '23505') throw hangmanEventError;
+
+      const { error: missionEventError } = await supabase.from('mission_events').insert({
+        mission_id: missionId,
+        event_type: event.type,
+        event_data: { ...payload, recorded_at: event.createdAt },
+        idempotency_key: event.id,
+      });
+      if (missionEventError && missionEventError.code !== '23505') throw missionEventError;
+
+      state.defs.hangmanSyncQueue.shift();
+      persistState();
+    }
+  } catch (error) {
+    if (error.status === 422 || error.statusCode === 422) hangmanSyncUnavailable = true;
+    console.warn('Hangman sync deferred; progress remains saved locally.');
+  } finally {
+    hangmanSyncInProgress = false;
+  }
 }
 
 function setScene(scene) {
@@ -740,25 +858,13 @@ function renderProtocolTransition() {
 function renderHangmanScene() {
   const hangman = state.defs.hangman;
   const selected = new Set(hangman.selectedLetters || []);
-  const revealedLetters = new Set(hangman.revealedLetters || []);
-  const status = getSecurityStatus(hangman.lives);
   const wordLines = getHangmanWordState(hangman.phrase, hangman.revealedLetters || []);
-
-  const keyboardLetters = Array.from('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+  const keyboardRows = ['QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM'];
 
   return `
-    <section class="screen dossier" aria-label="Hangman security breach">
+    <section class="screen dossier" aria-label="Classified destination letter investigation">
       <div class="title-block">
-        <h2>HANGMAN // SECURITY SYSTEM</h2>
-      </div>
-
-      <div class="status-strip">
-        <div><strong>AGENT STATUS</strong></div>
-        <div><strong>SECURITY INTEGRITY: ${hangman.lives} / ${hangman.maxLives}</strong></div>
-      </div>
-
-      <div class="notice-box" style="margin-top: 12px;">
-        <strong>${status}</strong>
+        <h2>CLASSIFIED INVESTIGATION</h2>
       </div>
 
       <div class="notice-box protocol-destination-prompt" style="margin-top: 12px;">
@@ -771,22 +877,30 @@ function renderHangmanScene() {
       </div>
 
       <div class="keyboard">
-        ${keyboardLetters.map((letter) => {
-          const isSelected = selected.has(letter);
-          const isCorrect = (hangman.revealedLetters || []).includes(letter);
-          return `<button class="key-button ${isSelected ? 'is-selected' : ''} ${!isCorrect && isSelected ? 'is-wrong' : ''}" data-letter="${letter}" ${isSelected ? 'disabled' : ''}>${letter}</button>`;
-        }).join('')}
+        ${keyboardRows.map((row, rowIndex) => `
+          <div class="keyboard-row keyboard-row--${rowIndex + 1}">
+            ${Array.from(row).map((letter) => {
+              const isSelected = selected.has(letter);
+              const isCorrect = (hangman.revealedLetters || []).includes(letter);
+              const isWrong = (hangman.incorrectLetters || []).includes(letter);
+              const keyState = isCorrect ? 'is-correct' : isWrong ? 'is-wrong' : '';
+              const disabled = isSelected || Boolean(hangman.pendingIncorrectLetter);
+              const stateLabel = isCorrect ? 'correct' : isWrong ? 'incorrect' : 'available';
+              return `<button class="key-button ${keyState}" type="button" data-letter="${letter}" aria-label="${letter}, ${stateLabel}" aria-pressed="${isSelected}" ${disabled ? 'disabled' : ''}>${letter}</button>`;
+            }).join('')}
+          </div>
+        `).join('')}
       </div>
 
-      ${hangman.lives <= 2 ? `
-        <div class="alert-box" style="margin-top: 18px;">
+      ${hangman.pendingIncorrectLetter ? `
+        <div class="alert-box hangman-save-panel" role="alert" aria-live="assertive">
           <strong>SECURITY BREACH</strong><br>
-          Agent Prism, that was not the letter.<br>
-          COST TO CONTINUE:<br>
+          That wasn't the letter.<br><br>
+          <strong>COST TO CONTINUE</strong><br>
           💋 1 KISS<br><br>
           Agent Lama will be collecting that one later. ❤️
-          <div style="margin-top: 12px;">
-            <button class="primary-button" type="button" data-action="save-hangman">[ SAVE THE INVESTIGATION ]</button>
+          <div class="hangman-save-actions">
+            <button class="primary-button" type="button" data-action="save-hangman">💋 SAVE THE INVESTIGATION</button>
           </div>
         </div>
       ` : ''}
@@ -801,37 +915,52 @@ function bindHangmanActions() {
       const letter = button.dataset.letter;
       const hangman = state.defs.hangman;
       const selected = new Set(hangman.selectedLetters || []);
-      if (selected.has(letter)) return;
+      if (selected.has(letter) || hangman.pendingIncorrectLetter) return;
 
+      const stateBefore = snapshotHangman();
       selected.add(letter);
       hangman.selectedLetters = [...selected];
-      const before = hangman.lives;
       const nextLetters = revealLettersForGuess(hangman.phrase, hangman.revealedLetters || [], letter);
       const correct = nextLetters.length > (hangman.revealedLetters || []).length;
-      hangman.revealedLetters = nextLetters;
 
-      if (!correct) {
-        hangman.lives = Math.max(0, hangman.lives - 1);
+      if (correct) {
+        hangman.revealedLetters = nextLetters;
+      } else {
+        hangman.incorrectLetters = [...new Set([...(hangman.incorrectLetters || []), letter])];
+        hangman.pendingIncorrectLetter = letter;
       }
 
+      const isComplete = correct
+        && (hangman.revealedLetters || []).length === new Set(hangman.phrase.toUpperCase().replace(/\s/g, '')).size;
+      if (isComplete) hangman.status = 'completed';
+
+      const stateAfter = snapshotHangman();
       const event = {
         missionId: state.missionId,
         type: correct ? 'hangman_letter_correct' : 'hangman_letter_incorrect',
         selectedLetter: letter,
         correct,
-        livesBefore: before,
-        livesAfter: hangman.lives,
-        revealedState: hangman.revealedLetters,
+        livesBefore: stateBefore.lives,
+        livesAfter: stateAfter.lives,
+        revealedState: stateAfter.revealedLetters,
+        stateBefore,
+        stateAfter,
         timestamp: new Date().toISOString(),
       };
 
-      pushEvent('hangman_letter_selected', event);
+      recordHangmanEvent('hangman_letter_selected', event);
 
-      if ((hangman.revealedLetters || []).length === (new Set(hangman.phrase.toUpperCase().replace(/\s/g, '').split(''))).size) {
+      if (!correct) {
+        render();
+        return;
+      }
+
+      if (isComplete) {
+        state.defs.completionSource = 'hangman';
         state.scene = 'success';
         state.defs.finalAnswer = normalizeText(MISSION_ANSWER);
         state.defs.finalCompletedAt = new Date().toISOString();
-        pushEvent('destination_revealed', { answer: MISSION_ANSWER, source: 'hangman' });
+        pushEvent('destination_revealed', { answer: MISSION_ANSWER, source: 'hangman', missionId: state.missionId });
         render();
         return;
       }
@@ -844,10 +973,21 @@ function bindHangmanActions() {
   if (saveButton) {
     saveButton.addEventListener('click', () => {
       const hangman = state.defs.hangman;
-      const before = hangman.lives;
-      hangman.lives = Math.min(hangman.maxLives, hangman.lives + 1);
+      if (!hangman.pendingIncorrectLetter) return;
+
+      const stateBefore = snapshotHangman();
+      const incorrectLetter = hangman.pendingIncorrectLetter;
+      hangman.pendingIncorrectLetter = null;
       hangman.saveCount = (hangman.saveCount || 0) + 1;
-      pushEvent('hangman_save_used', { before, after: hangman.lives, saveNumber: hangman.saveCount });
+      const stateAfter = snapshotHangman();
+      recordHangmanEvent('hangman_save_used', {
+        incorrectLetter,
+        saveNumber: hangman.saveCount,
+        stateBefore,
+        stateAfter,
+        timestamp: new Date().toISOString(),
+        digitalAction: 'kiss_credit_accepted',
+      });
       render();
     });
   }
@@ -855,6 +995,7 @@ function bindHangmanActions() {
 
 function renderSuccessScene() {
   const finalAnswer = state.defs.finalAnswer || MISSION_ANSWER;
+  const discoveredThroughHangman = state.defs.completionSource === 'hangman';
   return `
     <section class="screen dossier" aria-label="Mission success">
       <div class="title-block">
@@ -864,14 +1005,21 @@ function renderSuccessScene() {
       <div class="big-reveal">HARRY POTTER ESCAPE ROOM</div>
 
       <div class="final-transmission">
-        <p class="paragraph">Agent Prism has successfully breached the classified information.</p>
-        <p class="paragraph">Agent Lama is impressed. ❤️</p>
-        <p class="paragraph">You figured it out.</p>
-        <p class="paragraph">MISSION OBJECTIVE COMPLETE.</p>
-        <p class="paragraph">Well done, Agent Prism. ❤️</p>
-        <p class="paragraph">Now you officially know where we're going.</p>
-        <p class="paragraph">So there's only one thing left...</p>
-        <p class="paragraph">You can come to the event.</p>
+        ${discoveredThroughHangman ? `
+          <p class="paragraph">Agent Prism... you found it.</p>
+          <p class="paragraph">The classified destination is yours to uncover.</p>
+          <p class="paragraph">Your next mission is to escape.</p>
+          <p class="paragraph">Agent Lama is very impressed. And very glad he gets to share this adventure with you. ❤️</p>
+        ` : `
+          <p class="paragraph">Agent Prism has successfully breached the classified information.</p>
+          <p class="paragraph">Agent Lama is impressed. ❤️</p>
+          <p class="paragraph">You figured it out.</p>
+          <p class="paragraph">MISSION OBJECTIVE COMPLETE.</p>
+          <p class="paragraph">Well done, Agent Prism. ❤️</p>
+          <p class="paragraph">Now you officially know where we're going.</p>
+          <p class="paragraph">So there's only one thing left...</p>
+          <p class="paragraph">You can come to the event.</p>
+        `}
       </div>
 
       <div class="timeline" aria-label="Mission summary" style="margin-top: 16px;">
@@ -1029,6 +1177,7 @@ if (new URLSearchParams(window.location.search).get('test') === '1') {
 syncSound();
 
 render();
+void flushHangmanSyncQueue();
 
 window.addEventListener('storage', () => {
   state = loadState();

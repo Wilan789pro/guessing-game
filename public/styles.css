@@ -362,29 +362,87 @@ input[type="text"], input[type="password"] {
 }
 
 .keyboard {
-  display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  width: min(100%, 560px);
   margin-top: 18px;
+  margin-inline: auto;
+  padding-bottom: max(0px, env(safe-area-inset-bottom));
+  touch-action: manipulation;
+}
+
+.keyboard-row {
+  display: grid;
+  gap: clamp(3px, 1vw, 7px);
+  width: 100%;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+}
+
+.keyboard-row--2 {
+  width: 90%;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+}
+
+.keyboard-row--3 {
+  width: 76%;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
 }
 
 .key-button {
-  min-height: 42px;
-  padding: 0.7rem 0.5rem;
+  min-width: 0;
+  min-height: 48px;
+  padding: 0;
   text-transform: uppercase;
   font-weight: 700;
+  font-size: clamp(0.85rem, 3.8vw, 1rem);
+  line-height: 1;
+  border-radius: 3px;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
 }
 
-.key-button.is-selected {
+.key-button:not(:disabled):active {
+  transform: translateY(1px) scale(0.97);
+  background: rgba(214, 193, 149, 0.14);
+}
+
+.key-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.82;
+}
+
+.key-button.is-correct {
   background: rgba(124, 238, 168, 0.12);
   border-color: rgba(124, 238, 168, 0.7);
   color: var(--green);
+  box-shadow: inset 0 0 0 1px rgba(124, 238, 168, 0.08);
 }
 
 .key-button.is-wrong {
   background: rgba(255, 107, 107, 0.1);
   border-color: rgba(255, 107, 107, 0.6);
   color: var(--danger);
+}
+
+.hangman-save-panel {
+  max-width: 560px;
+  margin: 20px auto 0;
+  border-color: rgba(255, 107, 107, 0.62);
+  animation: fadeInUp 220ms ease-out both;
+}
+
+.hangman-save-actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 14px;
+}
+
+.hangman-save-actions button {
+  width: min(100%, 360px);
 }
 
 .word-grid {
@@ -671,13 +729,17 @@ input[type="text"], input[type="password"] {
     width: 100%;
   }
 
-  .keyboard {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-  }
-
   .no-button {
     min-width: 110px;
   }
+}
+
+@media (max-width: 380px) {
+  .keyboard { gap: 5px; }
+  .keyboard-row { gap: 3px; }
+  .keyboard-row--2 { width: 92%; }
+  .keyboard-row--3 { width: 80%; }
+  .key-button { min-height: 46px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
