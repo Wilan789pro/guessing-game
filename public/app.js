@@ -28,6 +28,10 @@ const DEFAULT_STATE = {
     hangman: createHangmanState(),
     finalAnswer: null,
     finalCompletedAt: null,
+    completionSource: null,
+    completionEventId: null,
+    successSyncQueue: [],
+    successSequenceComplete: false,
     reportGenerated: false,
     reportShared: false,
     shareAttempted: false,
@@ -45,6 +49,7 @@ const audioEl = document.getElementById('audio-context');
 let state = loadState();
 let soundOn = localStorage.getItem('agent-prism-sound') !== 'off';
 let suppressTyping = false;
+let successSequenceRunning = false;
 
 const terminalSequence = [
   'ESTABLISHING SECURE CONNECTION...',
@@ -125,6 +130,8 @@ function recordHangmanEvent(type, payload) {
 
 let hangmanSyncInProgress = false;
 let hangmanSyncUnavailable = false;
+let successSyncInProgress = false;
+let successSyncUnavailable = false;
 
 async function ensureHangmanRemoteMission() {
   if (!supabase) return null;
@@ -227,6 +234,100 @@ async function flushHangmanSyncQueue() {
   }
 }
 
+function queueMissionCompletion(source, successfulGuess = null, successfulGuessEvent = null) {
+  state.scene = 'success';
+  state.defs.successSequenceInitializing = true;
+  state.defs.completionSource = source;
+  state.defs.finalAnswer = normalizeText(MISSION_ANSWER);
+  state.defs.finalCompletedAt = state.defs.finalCompletedAt || new Date().toISOString();
+  state.defs.successSyncQueue = state.defs.successSyncQueue || [];
+
+  if (successfulGuess) {
+    state.defs.successSyncQueue.push({
+      id: successfulGuessEvent?.id || `${state.missionId}-successful-guess-${successfulGuess.guessNumber}`,
+      type: 'successful_guess',
+      createdAt: successfulGuessEvent?.time || new Date().toISOString(),
+      payload: { ...successfulGuess, source },
+    });
+  }
+
+  if (!state.defs.completionEventId) {
+    const completionEvent = pushEvent('destination_revealed', {
+      answer: MISSION_ANSWER,
+      source,
+      missionId: state.missionId,
+      completedAt: state.defs.finalCompletedAt,
+    });
+    state.defs.completionEventId = completionEvent.id;
+    state.defs.successSyncQueue.push({
+      id: completionEvent.id,
+      type: 'destination_revealed',
+      createdAt: completionEvent.time,
+      payload: {
+        answer: MISSION_ANSWER,
+        source,
+        completedAt: state.defs.finalCompletedAt,
+      },
+    });
+  }
+
+  persistState();
+  state.defs.successSequenceInitializing = false;
+  void flushSuccessSyncQueue();
+}
+
+async function flushSuccessSyncQueue() {
+  if (!supabase || successSyncUnavailable || successSyncInProgress || !(state.defs.successSyncQueue || []).length) return;
+
+  successSyncInProgress = true;
+  try {
+    const missionId = await ensureHangmanRemoteMission();
+    while (state.defs.successSyncQueue?.length) {
+      const item = state.defs.successSyncQueue[0];
+
+      if (item.type === 'successful_guess') {
+        const guess = item.payload;
+        const { error: guessError } = await supabase.from('guesses').insert({
+          mission_id: missionId,
+          guess_text: guess.guessText,
+          normalized_guess: guess.normalizedGuess,
+          guess_number: guess.guessNumber,
+          correct: true,
+        });
+        if (guessError && guessError.code !== '23505') throw guessError;
+      } else {
+        const { error: completionError } = await supabase
+          .from('missions')
+          .update({
+            current_scene: 'success',
+            status: 'completed',
+            completed: true,
+            completed_at: state.defs.finalCompletedAt,
+            final_answer: MISSION_ANSWER,
+          })
+          .eq('id', missionId);
+        if (completionError) throw completionError;
+      }
+
+      const { error: eventError } = await supabase.from('mission_events').insert({
+        mission_id: missionId,
+        event_type: item.type === 'successful_guess' ? 'guess_submitted' : 'destination_revealed',
+        event_data: { ...item.payload, recorded_at: item.createdAt, idempotency_key: item.id },
+        idempotency_key: item.id,
+      });
+      if (eventError && eventError.code !== '23505') throw eventError;
+
+      state.defs.successSyncQueue.shift();
+      persistState();
+    }
+  } catch (error) {
+    if (error.status === 422 || error.statusCode === 422) successSyncUnavailable = true;
+    console.warn('Mission completion sync deferred; progress remains saved locally.');
+  } finally {
+    successSyncInProgress = false;
+  }
+}
+
 function setScene(scene) {
   state.scene = scene;
   persistState();
@@ -311,8 +412,8 @@ function render() {
   }
 
   if (scene === 'success') {
-    app.innerHTML = renderSuccessScene();
-    bindSuccessActions();
+    if (successSequenceRunning || state.defs.successSequenceInitializing) return;
+    renderSuccessScene();
     return;
   }
 
@@ -602,10 +703,21 @@ function bindGuessingActions() {
       pushEvent('direct_answer_submitted', { answer: rawValue, normalizedAnswer: normalized, correct: isCorrect, partial: isPartial, cost: 100 });
 
       if (isCorrect) {
-        state.scene = 'success';
-        state.defs.finalAnswer = normalized;
-        state.defs.finalCompletedAt = new Date().toISOString();
-        pushEvent('destination_revealed', { answer: normalized, source: 'direct_answer' });
+        const guessNumber = (state.defs.guesses || []).length + 1;
+        state.defs.guesses = [...(state.defs.guesses || []), {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          guessNumber,
+          guessText: rawValue,
+          normalizedGuess: normalized,
+          correct: true,
+          createdAt: new Date().toISOString(),
+          source: 'direct_answer',
+        }];
+        queueMissionCompletion('direct_answer', {
+          guessText: rawValue,
+          normalizedGuess: normalized,
+          guessNumber,
+        });
         render();
         return;
       }
@@ -647,13 +759,14 @@ function bindGuessingActions() {
         ? 'DESTINATION CONFIRMED\n\nHARRY POTTER ESCAPE ROOM\n\nAgent Prism has successfully breached the classified information.'
         : 'GUESS REJECTED.\nBut I like where your mind is going. ❤️';
 
-      pushEvent('guess_submitted', { guessText: rawValue, normalizedGuess: normalized, guessNumber, correct: isCorrect, stage: state.scene });
+      const guessSubmissionEvent = pushEvent('guess_submitted', { guessText: rawValue, normalizedGuess: normalized, guessNumber, correct: isCorrect, stage: state.scene });
 
       if (isCorrect) {
-        state.defs.finalAnswer = normalized;
-        state.scene = 'success';
-        state.defs.finalCompletedAt = new Date().toISOString();
-        pushEvent('destination_revealed', { answer: normalized, missionId: state.missionId });
+        queueMissionCompletion('guessing', {
+          guessText: rawValue,
+          normalizedGuess: normalized,
+          guessNumber,
+        }, guessSubmissionEvent);
         render();
         return;
       }
@@ -956,11 +1069,7 @@ function bindHangmanActions() {
       }
 
       if (isComplete) {
-        state.defs.completionSource = 'hangman';
-        state.scene = 'success';
-        state.defs.finalAnswer = normalizeText(MISSION_ANSWER);
-        state.defs.finalCompletedAt = new Date().toISOString();
-        pushEvent('destination_revealed', { answer: MISSION_ANSWER, source: 'hangman', missionId: state.missionId });
+        queueMissionCompletion('hangman');
         render();
         return;
       }
@@ -994,57 +1103,101 @@ function bindHangmanActions() {
 }
 
 function renderSuccessScene() {
-  const finalAnswer = state.defs.finalAnswer || MISSION_ANSWER;
-  const discoveredThroughHangman = state.defs.completionSource === 'hangman';
-  return `
-    <section class="screen dossier" aria-label="Mission success">
-      <div class="title-block">
-        <h2>DESTINATION CONFIRMED</h2>
-      </div>
-
-      <div class="big-reveal">HARRY POTTER ESCAPE ROOM</div>
-
-      <div class="final-transmission">
-        ${discoveredThroughHangman ? `
-          <p class="paragraph">Agent Prism... you found it.</p>
-          <p class="paragraph">The classified destination is yours to uncover.</p>
-          <p class="paragraph">Your next mission is to escape.</p>
-          <p class="paragraph">Agent Lama is very impressed. And very glad he gets to share this adventure with you. ❤️</p>
-        ` : `
-          <p class="paragraph">Agent Prism has successfully breached the classified information.</p>
-          <p class="paragraph">Agent Lama is impressed. ❤️</p>
-          <p class="paragraph">You figured it out.</p>
-          <p class="paragraph">MISSION OBJECTIVE COMPLETE.</p>
-          <p class="paragraph">Well done, Agent Prism. ❤️</p>
-          <p class="paragraph">Now you officially know where we're going.</p>
-          <p class="paragraph">So there's only one thing left...</p>
-          <p class="paragraph">You can come to the event.</p>
-        `}
-      </div>
-
-      <div class="timeline" aria-label="Mission summary" style="margin-top: 16px;">
-        <div class="timeline-item"><span class="timeline-time">SATURDAY</span><span>03 OCTOBER 2026</span></div>
-        <div class="timeline-item"><span class="timeline-time">08:30 AM</span><span>Agent Lama will pick you up.</span></div>
-        <div class="timeline-item"><span class="timeline-time">DEVELOPERS FESTIVAL</span><span>Lunch + adventure</span></div>
-        <div class="timeline-item"><span class="timeline-time">ACTIVITY</span><span>HARRY POTTER ESCAPE ROOM</span></div>
-      </div>
-
-      <div class="final-transmission" style="margin-top: 16px;">
-        <p class="paragraph">Come prepared.</p>
-        <p class="paragraph">Smart casual.</p>
-        <p class="paragraph">Comfortable footwear.</p>
-        <p class="paragraph">You will understand later. ❤️</p>
-      </div>
-
-      <div class="actions" style="margin-top: 16px; justify-content: center;">
-        <button class="primary-button" type="button" data-action="show-report">GENERATE MISSION REPORT</button>
-      </div>
-
-      <div class="notice-box" style="margin-top: 16px;">
-        <strong>FINAL ANSWER:</strong> ${finalAnswer}
-      </div>
+  app.innerHTML = `
+    <section class="screen success-screen" aria-label="Classified destination revealed" aria-live="polite">
+      <div class="success-sequence" id="success-sequence"></div>
     </section>
   `;
+  runSuccessSequence();
+}
+
+function runSuccessSequence() {
+  if (successSequenceRunning) return;
+  successSequenceRunning = true;
+
+  const sequence = document.getElementById('success-sequence');
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const pause = (milliseconds) => reducedMotion ? Math.min(milliseconds, 60) : milliseconds;
+  const steps = [
+    { html: '<h2 class="success-kicker">DESTINATION CONFIRMED</h2>', delay: 620 },
+    { html: '<div class="big-reveal success-answer">HARRY POTTER ESCAPE ROOM</div>', delay: 720 },
+    { html: '<div class="success-phase">INVESTIGATION COMPLETE</div>', delay: 480 },
+    { html: '<p class="success-personal"><strong>Well done, Agent Prism. ❤️</strong><br>You actually figured it out.</p>', delay: 620 },
+    { html: '<p class="success-personal">Agent Lama is impressed.</p>', delay: 560 },
+    { html: '<p class="success-personal">Your classified destination has been successfully uncovered.</p>', delay: 650 },
+    { html: '<div class="success-phase">WHICH MEANS...</div>', delay: 560 },
+    { html: '<div class="success-invitation">YOU CAN COME TO THE EVENT. ❤️</div>', delay: 850 },
+    { html: `
+      <section class="success-details" aria-label="Confirmed mission details">
+        <h3>SATURDAY, 03 OCTOBER 2026</h3>
+        <p><strong>08:30 AM</strong><br>Agent Lama will pick you up.</p>
+        <p><strong>FIRST OBJECTIVE</strong><br>Developers Festival</p>
+        <p><strong>LUNCH CHECKPOINT</strong><br>Details to be revealed during the mission.</p>
+        <p><strong>CLASSIFIED DESTINATION</strong><br>Harry Potter Escape Room</p>
+        <p><strong>DRESS CODE</strong><br>Smart casual<br>Comfortable footwear<br><em>You will understand later.</em></p>
+      </section>
+    `, delay: 850 },
+    { html: `
+      <section class="success-transmission" aria-label="Final transmission">
+        <h3>FINAL TRANSMISSION</h3>
+        <p><strong>AGENT PRISM</strong></p>
+        <p>Your mission has been accepted.</p>
+        <p>Agent Lama will be waiting.</p>
+        <p>Come prepared.</p>
+        <p>Trust the handler.</p>
+        <p>And most importantly...</p>
+        <p><strong>Have fun. ❤️</strong></p>
+        <p>— <strong>Agent Lama</strong></p>
+        <p class="success-status">MISSION STATUS: ACTIVE</p>
+      </section>
+    `, delay: 1350 },
+    { html: '<div class="self-destruct">THIS MESSAGE WILL SELF-DESTRUCT IN...</div>', delay: 420 },
+    { html: '<div class="self-destruct-count">3</div>', delay: 420 },
+    { html: '<div class="self-destruct-count">2</div>', delay: 420 },
+    { html: '<div class="self-destruct-count">1</div>', delay: 420 },
+    { html: '<div class="self-destruct-error">ERROR</div>', delay: 500 },
+    { html: '<p class="self-destruct-joke">Agent Lama clearly didn\'t pay for the self-destruct feature. 😂</p>', delay: 600 },
+    { html: '<div class="success-goodbye"><strong>MISSION ACTIVE</strong><br>See you Saturday, Agent Prism. ❤️</div>', delay: 450 },
+  ];
+
+  const revealStep = (index) => {
+    if (index >= steps.length) {
+      const actions = document.createElement('div');
+      actions.className = 'actions success-actions';
+      actions.innerHTML = '<button class="primary-button" type="button" data-action="show-report">GENERATE MISSION REPORT</button>';
+      sequence.append(actions);
+      bindSuccessActions();
+      successSequenceRunning = false;
+      state.defs.successSequenceComplete = true;
+      persistState();
+      return;
+    }
+
+    const step = steps[index];
+    const item = document.createElement('div');
+    item.className = 'success-reveal';
+    item.innerHTML = step.html;
+    sequence.append(item);
+    window.setTimeout(() => revealStep(index + 1), pause(step.delay));
+  };
+
+  if (state.defs.successSequenceComplete) {
+    steps.forEach((step) => {
+      const item = document.createElement('div');
+      item.className = 'success-reveal';
+      item.innerHTML = step.html;
+      sequence.append(item);
+    });
+    successSequenceRunning = false;
+    const actions = document.createElement('div');
+    actions.className = 'actions success-actions';
+    actions.innerHTML = '<button class="primary-button" type="button" data-action="show-report">GENERATE MISSION REPORT</button>';
+    sequence.append(actions);
+    bindSuccessActions();
+    return;
+  }
+
+  revealStep(0);
 }
 
 function bindSuccessActions() {
@@ -1178,6 +1331,7 @@ syncSound();
 
 render();
 void flushHangmanSyncQueue();
+void flushSuccessSyncQueue();
 
 window.addEventListener('storage', () => {
   state = loadState();
@@ -1185,7 +1339,7 @@ window.addEventListener('storage', () => {
 });
 
 window.addEventListener('mission-state-updated', () => {
-  if (document.visibilityState === 'visible') {
+  if (document.visibilityState === 'visible' && !successSequenceRunning && !state.defs.successSequenceInitializing) {
     render();
   }
 });
