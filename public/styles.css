@@ -79,6 +79,58 @@ button:focus-visible, input:focus-visible {
   flex-wrap: wrap;
 }
 
+.reset-mission-button {
+  min-height: 36px;
+  padding: 0.45rem 0.65rem;
+  border-color: rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.reset-mission-button:hover {
+  border-color: rgba(214, 193, 149, 0.55);
+  color: var(--cream);
+}
+
+.reset-mission-dialog {
+  width: min(440px, calc(100% - 28px));
+  padding: 22px;
+  border: 1px solid var(--border-strong);
+  background: #101216;
+  color: var(--text);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.72);
+}
+
+.reset-mission-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.78);
+  backdrop-filter: blur(3px);
+}
+
+.reset-mission-dialog h2 {
+  margin: 0 0 18px;
+  color: var(--cream);
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 18px;
+}
+
+.reset-mission-dialog p {
+  margin: 8px 0;
+  color: var(--muted);
+}
+
+.reset-mission-actions {
+  display: grid;
+  gap: 9px;
+  margin-top: 22px;
+}
+
+.reset-mission-actions button {
+  width: 100%;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -838,6 +890,38 @@ input[type="text"], input[type="password"] {
 
 .event-stream-panel {
   margin-top: 18px;
+}
+
+.session-history {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.session-history__item {
+  border-top: 1px solid var(--border);
+  padding-top: 9px;
+}
+
+.session-history__item summary {
+  color: var(--text);
+  cursor: pointer;
+  font-family: "Consolas", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.session-history__events {
+  display: grid;
+  gap: 6px;
+  max-height: 320px;
+  margin: 10px 0;
+  padding-left: 22px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  font-family: "Consolas", monospace;
+  font-size: 12px;
 }
 
 @media (max-width: 700px) {

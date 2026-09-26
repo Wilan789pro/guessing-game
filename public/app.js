@@ -1,55 +1,68 @@
 import { supabase } from './supabase-client.js';
-import { MISSION_ANSWER, HINTS, normalizeText, isCorrectGuess, isPartialGuess, getGuessOutcome, getNoScale, getNoReaction, getHangmanWordState, revealLettersForGuess, createHangmanState } from './lib/missionLogic.js';
+import { MISSION_ANSWER, HINTS, normalizeText, isCorrectGuess, isPartialGuess, getGuessOutcome, getNoScale, getNoReaction, getHangmanWordState, revealLettersForGuess, createHangmanState, createMissionSessionId, isMissionSessionCompleted, shouldResumeMissionSession } from './lib/missionLogic.js';
 
 const STORAGE_KEY = 'agent-prism-mission-state-v1';
+const SESSION_POINTER_KEY = 'agent-prism-active-session-v1';
+const SESSION_STATE_PREFIX = `${STORAGE_KEY}:session:`;
+const SESSION_INDEX_KEY = `${STORAGE_KEY}:session-index`;
 const HIDDEN_HANGMAN_THRESHOLD = 10;
-const DEFAULT_STATE = {
-  missionId: `mission-${Date.now()}`,
-  createdAt: new Date().toISOString(),
-  updatedAt: new Date().toISOString(),
-  scene: 'boot',
-  missionAccepted: true,
-  missionAcceptedAt: null,
-  noCount: 0,
-  noPosition: { x: 82, y: 72 },
-  noButtonHidden: false,
-  yesScale: 1,
-  reaction: '',
-  defs: {
-    directAnswerProtocolRequested: false,
-    directAnswerCost: 100,
-    kissProtocolAccepted: false,
-    kissProtocolAcceptedAt: null,
-    guessingIntroStarted: false,
-    hintsUnlocked: [],
-    hints: [],
-    guesses: [],
-    guessNumber: 0,
-    hangman: createHangmanState(),
-    finalAnswer: null,
-    finalCompletedAt: null,
-    completionSource: null,
-    completionEventId: null,
-    successSyncQueue: [],
-    successSequenceComplete: false,
-    reportGenerated: false,
-    reportShared: false,
-    shareAttempted: false,
-    shareSucceeded: false,
-    lastActivity: new Date().toISOString(),
-  },
-  eventLog: [],
-};
+let sessionToArchiveAtStartup = null;
+
+function createDefaultState(missionId) {
+  const now = new Date().toISOString();
+  return {
+    missionId,
+    createdAt: now,
+    updatedAt: now,
+    scene: 'boot',
+    missionAccepted: true,
+    missionAcceptedAt: null,
+    noCount: 0,
+    noPosition: { x: 82, y: 72 },
+    noButtonHidden: false,
+    yesScale: 1,
+    reaction: '',
+    defs: {
+      directAnswerProtocolRequested: false,
+      directAnswerCost: 100,
+      kissProtocolAccepted: false,
+      kissProtocolAcceptedAt: null,
+      guessingIntroStarted: false,
+      hintsUnlocked: [],
+      hints: [],
+      guesses: [],
+      guessNumber: 0,
+      hangman: createHangmanState(),
+      finalAnswer: null,
+      finalCompletedAt: null,
+      completionSource: null,
+      completionEventId: null,
+      successSequenceComplete: false,
+      reportGenerated: false,
+      reportShared: false,
+      shareAttempted: false,
+      shareSucceeded: false,
+      lastActivity: now,
+      missionEventSyncQueue: [],
+      hangmanSyncQueue: [],
+      successSyncQueue: [],
+      supabaseMissionId: null,
+      syncUnavailable: false,
+    },
+    eventLog: [],
+  };
+}
 
 const app = document.getElementById('app');
 const soundToggle = document.getElementById('sound-toggle');
 const resetTestButton = document.getElementById('reset-test-mission');
 const audioEl = document.getElementById('audio-context');
 
-let state = loadState();
+let state = initializeSessionState();
 let soundOn = localStorage.getItem('agent-prism-sound') !== 'off';
 let suppressTyping = false;
 let successSequenceRunning = false;
+let bootSequenceRunning = false;
 
 const terminalSequence = [
   'ESTABLISHING SECURE CONNECTION...',
@@ -60,80 +73,125 @@ const terminalSequence = [
   'TRANSMISSION RELAY READY.'
 ];
 
-function loadState() {
+function mergeStoredState(stored, missionId) {
+  const defaults = createDefaultState(missionId);
+  const nextState = {
+    ...defaults,
+    ...stored,
+    missionId,
+    defs: {
+      ...defaults.defs,
+      ...(stored.defs || {}),
+      hangman: { ...createHangmanState(), ...(stored.defs?.hangman || {}) },
+      missionEventSyncQueue: stored.defs?.missionEventSyncQueue || [],
+      hangmanSyncQueue: stored.defs?.hangmanSyncQueue || [],
+      successSyncQueue: stored.defs?.successSyncQueue || [],
+      syncUnavailable: false,
+    },
+    noPosition: stored.noPosition || { x: 82, y: 72 },
+    eventLog: stored.eventLog || [],
+  };
+
+  return nextState;
+}
+
+function initializeSessionState() {
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
-    if (!stored) return JSON.parse(JSON.stringify(DEFAULT_STATE));
+    const activeSessionId = sessionStorage.getItem(SESSION_POINTER_KEY);
+    const stored = activeSessionId
+      ? JSON.parse(localStorage.getItem(`${SESSION_STATE_PREFIX}${activeSessionId}`) || 'null')
+      : null;
+    const navigationType = performance.getEntriesByType('navigation')[0]?.type || 'navigate';
 
-    const nextState = {
-      ...JSON.parse(JSON.stringify(DEFAULT_STATE)),
-      ...stored,
-      defs: {
-        ...JSON.parse(JSON.stringify(DEFAULT_STATE.defs)),
-        ...(stored.defs || {}),
-        hangman: { ...createHangmanState(), ...(stored.defs?.hangman || {}) },
-      },
-      noPosition: stored.noPosition || { x: 82, y: 72 },
-      eventLog: stored.eventLog || [],
-    };
-
-    if (nextState.scene === 'dossier' || nextState.scene === 'boot') {
-      nextState.scene = 'guessing';
-      nextState.missionAccepted = true;
-      nextState.missionAcceptedAt = new Date().toISOString();
-      nextState.defs.guessingIntroStarted = false;
+    if (stored && shouldResumeMissionSession(stored, navigationType)) {
+      return mergeStoredState(stored, activeSessionId);
     }
 
-    return nextState;
+    if (stored && !shouldResumeMissionSession(stored, navigationType) && !isMissionSessionCompleted(stored)) {
+      sessionToArchiveAtStartup = mergeStoredState(stored, activeSessionId);
+    }
+
+    return createNewSessionState();
   } catch (error) {
-    console.warn('State recovery failed', error);
-    return JSON.parse(JSON.stringify(DEFAULT_STATE));
+    console.warn('Session state recovery failed; starting a new investigation.');
+    return createNewSessionState();
   }
 }
 
-function persistState() {
-  state.updatedAt = new Date().toISOString();
-  state.defs.lastActivity = state.updatedAt;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+function createNewSessionState() {
+  const missionId = createMissionSessionId();
+  const nextState = createDefaultState(missionId);
+  nextState.defs.needsMissionStartedEvent = true;
+  sessionStorage.setItem(SESSION_POINTER_KEY, missionId);
+  rememberSessionId(missionId);
+  persistState(nextState);
+  return nextState;
+}
+
+function prepareNewSessionState() {
+  const missionId = createMissionSessionId();
+  const nextState = createDefaultState(missionId);
+  sessionStorage.setItem(SESSION_POINTER_KEY, missionId);
+  rememberSessionId(missionId);
+  return nextState;
+}
+
+function rememberSessionId(missionId) {
   try {
-    window.dispatchEvent(new CustomEvent('mission-state-updated', { detail: state }));
+    const ids = JSON.parse(localStorage.getItem(SESSION_INDEX_KEY) || '[]');
+    if (!ids.includes(missionId)) {
+      ids.push(missionId);
+      localStorage.setItem(SESSION_INDEX_KEY, JSON.stringify(ids));
+    }
+  } catch (error) {
+    localStorage.setItem(SESSION_INDEX_KEY, JSON.stringify([missionId]));
+  }
+}
+
+function persistState(targetState = state) {
+  targetState.updatedAt = new Date().toISOString();
+  targetState.defs.lastActivity = targetState.updatedAt;
+  localStorage.setItem(`${SESSION_STATE_PREFIX}${targetState.missionId}`, JSON.stringify(targetState));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(targetState));
+  try {
+    window.dispatchEvent(new CustomEvent('mission-state-updated', { detail: targetState }));
   } catch (error) {
     // no-op
   }
 }
 
-function pushEvent(type, payload = {}) {
-  state.eventLog = state.eventLog || [];
+function pushEvent(type, payload = {}, targetState = state) {
+  targetState.eventLog = targetState.eventLog || [];
   const event = {
-    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id: createMissionSessionId(),
     type,
     time: new Date().toISOString(),
     payload,
   };
-  state.eventLog.unshift(event);
-  if (state.eventLog.length > 150) state.eventLog.length = 150;
-  persistState();
+  targetState.eventLog.unshift(event);
+  if (targetState.eventLog.length > 150) targetState.eventLog.length = 150;
+  targetState.defs.missionEventSyncQueue = targetState.defs.missionEventSyncQueue || [];
+  targetState.defs.missionEventSyncQueue.push({ id: event.id, type, payload, createdAt: event.time });
+  persistState(targetState);
+  void flushMissionEventQueue(targetState);
   return event;
 }
 
-function snapshotHangman() {
-  return JSON.parse(JSON.stringify(state.defs.hangman));
+function snapshotHangman(missionState = state) {
+  return JSON.parse(JSON.stringify(missionState.defs.hangman));
 }
 
-function recordHangmanEvent(type, payload) {
-  const event = pushEvent(type, payload);
-  state.defs.hangmanSyncQueue = state.defs.hangmanSyncQueue || [];
-  state.defs.hangmanSyncQueue.push({ id: event.id, type, payload, createdAt: event.time });
-  persistState();
-  void flushHangmanSyncQueue();
+function recordHangmanEvent(type, payload, missionState = state) {
+  const event = pushEvent(type, payload, missionState);
+  missionState.defs.hangmanSyncQueue = missionState.defs.hangmanSyncQueue || [];
+  missionState.defs.hangmanSyncQueue.push({ id: event.id, type, payload, createdAt: event.time });
+  persistState(missionState);
+  void flushHangmanSyncQueue(missionState);
 }
 
-let hangmanSyncInProgress = false;
-let hangmanSyncUnavailable = false;
-let successSyncInProgress = false;
-let successSyncUnavailable = false;
+const syncInProgress = new Set();
 
-async function ensureHangmanRemoteMission() {
+async function ensureHangmanRemoteMission(missionState = state) {
   if (!supabase) return null;
 
   let { data: authData, error } = await supabase.auth.getSession();
@@ -145,15 +203,17 @@ async function ensureHangmanRemoteMission() {
     authData = result.data;
   }
 
-  if (state.defs.supabaseMissionId) return state.defs.supabaseMissionId;
+  if (missionState.defs.supabaseMissionId) return missionState.defs.supabaseMissionId;
 
   let { data: mission, error: missionError } = await supabase
     .from('missions')
     .insert({
-      session_token: state.missionId,
-      current_scene: 'hangman',
-      mission_accepted: Boolean(state.missionAccepted),
-      mission_accepted_at: state.missionAcceptedAt,
+      id: missionState.missionId,
+      session_token: missionState.missionId,
+      current_scene: missionState.scene,
+      status: 'open',
+      mission_accepted: Boolean(missionState.missionAccepted),
+      mission_accepted_at: missionState.missionAcceptedAt,
     })
     .select('id')
     .single();
@@ -162,32 +222,84 @@ async function ensureHangmanRemoteMission() {
     const existing = await supabase
       .from('missions')
       .select('id')
-      .eq('session_token', state.missionId)
+      .eq('id', missionState.missionId)
       .single();
     mission = existing.data;
     missionError = existing.error;
   }
 
   if (missionError) throw missionError;
-  state.defs.supabaseMissionId = mission.id;
-  persistState();
+  missionState.defs.supabaseMissionId = mission.id;
+  persistState(missionState);
   return mission.id;
 }
 
-async function flushHangmanSyncQueue() {
-  if (!supabase || hangmanSyncUnavailable || hangmanSyncInProgress) return;
-  const queue = state.defs.hangmanSyncQueue || [];
+async function flushMissionEventQueue(missionState = state) {
+  if (!supabase || missionState.defs.syncUnavailable || syncInProgress.has(missionState.missionId)) return;
+  const queue = missionState.defs.missionEventSyncQueue || [];
   if (!queue.length) return;
 
-  hangmanSyncInProgress = true;
+  syncInProgress.add(missionState.missionId);
   try {
-    const missionId = await ensureHangmanRemoteMission();
-    while (state.defs.hangmanSyncQueue?.length) {
-      const event = state.defs.hangmanSyncQueue[0];
-      const hangman = state.defs.hangman;
+    const missionId = await ensureHangmanRemoteMission(missionState);
+    while (missionState.defs.missionEventSyncQueue?.length) {
+      const event = missionState.defs.missionEventSyncQueue[0];
+      const eventPayload = event.payload || {};
+      const { error } = await supabase.from('mission_events').insert({
+        mission_id: missionId,
+        event_type: event.type,
+        event_data: { ...eventPayload, recorded_at: event.createdAt },
+        idempotency_key: event.id,
+      });
+      if (error && error.code !== '23505') throw error;
+
+      if (event.type === 'guess_submitted') {
+        const { error: guessError } = await supabase.from('guesses').insert({
+          mission_id: missionId,
+          guess_text: eventPayload.guessText || eventPayload.answer || '',
+          normalized_guess: eventPayload.normalizedGuess || eventPayload.normalizedAnswer || '',
+          guess_number: eventPayload.guessNumber || (missionState.defs.guesses || []).length,
+          correct: Boolean(eventPayload.correct),
+        });
+        if (guessError && guessError.code !== '23505') throw guessError;
+      }
+
+      if (event.type === 'mission_archived' || event.type === 'destination_revealed') {
+        const completed = event.type === 'destination_revealed';
+        const { error: missionError } = await supabase.from('missions').update({
+          status: completed ? 'completed' : 'archived',
+          completed,
+          completed_at: completed ? missionState.defs.finalCompletedAt : null,
+          final_answer: completed ? MISSION_ANSWER : null,
+        }).eq('id', missionId);
+        if (missionError) throw missionError;
+      }
+
+      missionState.defs.missionEventSyncQueue.shift();
+      persistState(missionState);
+    }
+  } catch (error) {
+    missionState.defs.syncUnavailable = true;
+    persistState(missionState);
+    console.warn('Mission events queued locally until a secure Supabase session is available.');
+  } finally {
+    syncInProgress.delete(missionState.missionId);
+    retryPendingSessionQueues(missionState);
+  }
+}
+
+async function flushHangmanSyncQueue(missionState = state) {
+  if (!supabase || missionState.defs.syncUnavailable || syncInProgress.has(missionState.missionId)) return;
+  if (!(missionState.defs.hangmanSyncQueue || []).length) return;
+
+  syncInProgress.add(missionState.missionId);
+  try {
+    const missionId = await ensureHangmanRemoteMission(missionState);
+    while (missionState.defs.hangmanSyncQueue?.length) {
+      const event = missionState.defs.hangmanSyncQueue[0];
       const payload = event.payload || {};
-      const after = payload.stateAfter || hangman;
-      const stateRow = {
+      const after = payload.stateAfter || missionState.defs.hangman;
+      const { error: stateError } = await supabase.from('hangman_state').upsert({
         mission_id: missionId,
         phrase: after.phrase,
         revealed_letters: after.revealedLetters || [],
@@ -198,11 +310,10 @@ async function flushHangmanSyncQueue() {
         max_lives: after.maxLives,
         save_count: after.saveCount || 0,
         status: after.status || 'active',
-      };
-      const { error: stateError } = await supabase.from('hangman_state').upsert(stateRow, { onConflict: 'mission_id' });
+      }, { onConflict: 'mission_id' });
       if (stateError) throw stateError;
 
-      const letterEvent = {
+      const { error } = await supabase.from('hangman_events').insert({
         mission_id: missionId,
         event_type: event.type,
         selected_letter: payload.selectedLetter || payload.incorrectLetter || null,
@@ -211,26 +322,56 @@ async function flushHangmanSyncQueue() {
         lives_after: payload.stateAfter?.lives ?? payload.livesAfter ?? after.lives,
         revealed_state: after.revealedLetters || [],
         idempotency_key: event.id,
-      };
-      const { error: hangmanEventError } = await supabase.from('hangman_events').insert(letterEvent);
-      if (hangmanEventError && hangmanEventError.code !== '23505') throw hangmanEventError;
-
-      const { error: missionEventError } = await supabase.from('mission_events').insert({
-        mission_id: missionId,
-        event_type: event.type,
-        event_data: { ...payload, recorded_at: event.createdAt },
-        idempotency_key: event.id,
       });
-      if (missionEventError && missionEventError.code !== '23505') throw missionEventError;
+      if (error && error.code !== '23505') throw error;
 
-      state.defs.hangmanSyncQueue.shift();
-      persistState();
+      missionState.defs.hangmanSyncQueue.shift();
+      persistState(missionState);
     }
   } catch (error) {
-    if (error.status === 422 || error.statusCode === 422) hangmanSyncUnavailable = true;
-    console.warn('Hangman sync deferred; progress remains saved locally.');
+    missionState.defs.syncUnavailable = true;
+    persistState(missionState);
+    console.warn('Hangman sync queued locally until a secure Supabase session is available.');
   } finally {
-    hangmanSyncInProgress = false;
+    syncInProgress.delete(missionState.missionId);
+    retryPendingSessionQueues(missionState);
+  }
+}
+
+function retryPendingSessionQueues(missionState) {
+  if (missionState.defs.syncUnavailable) return;
+  if (missionState.defs.missionEventSyncQueue?.length) {
+    window.setTimeout(() => void flushMissionEventQueue(missionState), 0);
+  }
+  if (missionState.defs.hangmanSyncQueue?.length) {
+    window.setTimeout(() => void flushHangmanSyncQueue(missionState), 0);
+  }
+  if (missionState.defs.successSyncQueue?.length) {
+    window.setTimeout(() => void flushSuccessSyncQueue(missionState), 0);
+  }
+}
+
+function retryStoredSessionQueues(forceRetry = false) {
+  let ids = [];
+  try {
+    ids = JSON.parse(localStorage.getItem(SESSION_INDEX_KEY) || '[]');
+  } catch (error) {
+    return;
+  }
+
+  for (const missionId of ids) {
+    try {
+      const stored = JSON.parse(localStorage.getItem(`${SESSION_STATE_PREFIX}${missionId}`) || 'null');
+      if (!stored) continue;
+      if (stored.defs?.syncUnavailable && !forceRetry && missionId !== state.missionId) continue;
+      const missionState = missionId === state.missionId ? state : mergeStoredState(stored, missionId);
+      missionState.defs.syncUnavailable = false;
+      void flushMissionEventQueue(missionState);
+      void flushHangmanSyncQueue(missionState);
+      void flushSuccessSyncQueue(missionState);
+    } catch (error) {
+      console.warn('An archived session remains queued locally.');
+    }
   }
 }
 
@@ -276,14 +417,14 @@ function queueMissionCompletion(source, successfulGuess = null, successfulGuessE
   void flushSuccessSyncQueue();
 }
 
-async function flushSuccessSyncQueue() {
-  if (!supabase || successSyncUnavailable || successSyncInProgress || !(state.defs.successSyncQueue || []).length) return;
+async function flushSuccessSyncQueue(missionState = state) {
+  if (!supabase || missionState.defs.syncUnavailable || syncInProgress.has(missionState.missionId) || !(missionState.defs.successSyncQueue || []).length) return;
 
-  successSyncInProgress = true;
+  syncInProgress.add(missionState.missionId);
   try {
-    const missionId = await ensureHangmanRemoteMission();
-    while (state.defs.successSyncQueue?.length) {
-      const item = state.defs.successSyncQueue[0];
+    const missionId = await ensureHangmanRemoteMission(missionState);
+    while (missionState.defs.successSyncQueue?.length) {
+      const item = missionState.defs.successSyncQueue[0];
 
       if (item.type === 'successful_guess') {
         const guess = item.payload;
@@ -302,7 +443,7 @@ async function flushSuccessSyncQueue() {
             current_scene: 'success',
             status: 'completed',
             completed: true,
-            completed_at: state.defs.finalCompletedAt,
+            completed_at: missionState.defs.finalCompletedAt,
             final_answer: MISSION_ANSWER,
           })
           .eq('id', missionId);
@@ -317,15 +458,41 @@ async function flushSuccessSyncQueue() {
       });
       if (eventError && eventError.code !== '23505') throw eventError;
 
-      state.defs.successSyncQueue.shift();
-      persistState();
+      missionState.defs.successSyncQueue.shift();
+      persistState(missionState);
     }
   } catch (error) {
-    if (error.status === 422 || error.statusCode === 422) successSyncUnavailable = true;
+    missionState.defs.syncUnavailable = true;
+    persistState(missionState);
     console.warn('Mission completion sync deferred; progress remains saved locally.');
   } finally {
-    successSyncInProgress = false;
+    syncInProgress.delete(missionState.missionId);
+    retryPendingSessionQueues(missionState);
   }
+}
+
+function startNewMission(reason, previousState = state) {
+  const previousSessionId = previousState?.missionId || null;
+  const archived = previousState && !previousState.defs?.finalCompletedAt;
+  const nextState = prepareNewSessionState();
+
+  if (archived) {
+    pushEvent('mission_archived', {
+      reason,
+      archivedAt: new Date().toISOString(),
+      nextSessionId: nextState.missionId,
+    }, previousState);
+  }
+
+  state = nextState;
+  persistState(state);
+  pushEvent('mission_started', {
+    startedAt: state.createdAt,
+    source: reason,
+    previousSessionId,
+  }, state);
+  render();
+  return state;
 }
 
 function setScene(scene) {
@@ -365,6 +532,8 @@ function render() {
   const scene = mission.scene;
 
   if (scene === 'boot') {
+    if (bootSequenceRunning) return;
+    bootSequenceRunning = true;
     app.innerHTML = renderBootScene();
     typeBootSequence();
     return;
@@ -447,6 +616,7 @@ function typeBootSequence() {
   function next() {
     if (index >= terminalSequence.length) {
       setTimeout(() => {
+        bootSequenceRunning = false;
         state.scene = 'guessing';
         state.missionAccepted = true;
         state.missionAcceptedAt = new Date().toISOString();
@@ -1318,30 +1488,58 @@ soundToggle.addEventListener('click', () => {
   syncSound();
 });
 
+const resetMissionButton = document.getElementById('reset-mission');
+const resetMissionDialog = document.getElementById('reset-mission-dialog');
+const confirmResetMissionButton = document.getElementById('confirm-reset-mission');
+const cancelResetMissionButton = document.getElementById('cancel-reset-mission');
+
+resetMissionButton.addEventListener('click', () => resetMissionDialog.showModal());
+cancelResetMissionButton.addEventListener('click', () => resetMissionDialog.close());
+confirmResetMissionButton.addEventListener('click', () => {
+  resetMissionDialog.close();
+  startNewMission('player_reset');
+});
+
 if (new URLSearchParams(window.location.search).get('test') === '1') {
   resetTestButton.classList.remove('hidden');
   resetTestButton.addEventListener('click', () => {
     if (!window.confirm('Reset this browser\'s test mission and restart?')) return;
-    localStorage.removeItem(STORAGE_KEY);
-    window.location.reload();
+    startNewMission('test_reset');
   });
 }
 
 syncSound();
 
+if (sessionToArchiveAtStartup) {
+  pushEvent('mission_archived', {
+    reason: 'new_visit_started',
+    archivedAt: new Date().toISOString(),
+  }, sessionToArchiveAtStartup);
+}
+
+if (state.defs.needsMissionStartedEvent) {
+  state.defs.needsMissionStartedEvent = false;
+  pushEvent('mission_started', {
+    startedAt: state.createdAt,
+    source: 'new_visit',
+    previousSessionId: sessionToArchiveAtStartup?.missionId || null,
+  });
+}
+
 render();
+void flushMissionEventQueue(state);
 void flushHangmanSyncQueue();
 void flushSuccessSyncQueue();
-
-window.addEventListener('storage', () => {
-  state = loadState();
-  render();
-});
+retryStoredSessionQueues();
 
 window.addEventListener('mission-state-updated', () => {
   if (document.visibilityState === 'visible' && !successSequenceRunning && !state.defs.successSequenceInitializing) {
     render();
   }
+});
+
+window.addEventListener('online', () => {
+  retryStoredSessionQueues(true);
 });
 
 if (navigator.userAgent.includes('Mobile')) {

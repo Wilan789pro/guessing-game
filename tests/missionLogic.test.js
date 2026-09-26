@@ -5,6 +5,9 @@ import {
   isCorrectGuess,
   isPartialGuess,
   getGuessOutcome,
+  createMissionSessionId,
+  isMissionSessionCompleted,
+  shouldResumeMissionSession,
   getNoScale,
   getNoReaction,
   getHangmanWordState,
@@ -32,6 +35,20 @@ test('guess evaluation distinguishes correct, partial, and incorrect answers', (
   assert.equal(getGuessOutcome('HARRY POTTER ESCAPE ROOM'), 'correct');
   assert.equal(getGuessOutcome('Harry Potter'), 'partial');
   assert.equal(getGuessOutcome('The Moon'), 'incorrect');
+});
+
+test('mission sessions use secure UUIDs and never resume completed visits', () => {
+  const firstSessionId = createMissionSessionId();
+  const secondSessionId = createMissionSessionId();
+  const activeSession = { missionId: firstSessionId, scene: 'hangman', defs: {} };
+  const completedSession = { missionId: firstSessionId, scene: 'success', defs: { finalCompletedAt: new Date().toISOString() } };
+
+  assert.match(firstSessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.notEqual(firstSessionId, secondSessionId);
+  assert.equal(shouldResumeMissionSession(activeSession, 'reload'), true);
+  assert.equal(shouldResumeMissionSession(activeSession, 'navigate'), false);
+  assert.equal(isMissionSessionCompleted(completedSession), true);
+  assert.equal(shouldResumeMissionSession(completedSession, 'reload'), false);
 });
 
 test('no button scaling matches expected progression', () => {

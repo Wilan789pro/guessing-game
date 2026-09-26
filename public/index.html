@@ -17,12 +17,23 @@
         </div>
         <div class="topbar__right">
           <button id="reset-test-mission" class="danger-button hidden" type="button">RESET TEST</button>
+          <button id="reset-mission" class="reset-mission-button" type="button">RESET MISSION</button>
           <button id="sound-toggle" class="ghost-button" type="button" aria-label="Toggle sound">SOUND: ON</button>
         </div>
       </header>
 
       <main id="app" class="app" aria-live="polite"></main>
     </div>
+
+    <dialog id="reset-mission-dialog" class="reset-mission-dialog" aria-labelledby="reset-mission-title">
+      <h2 id="reset-mission-title">RESET INVESTIGATION?</h2>
+      <p>This will begin a new investigation session.</p>
+      <p>Your current investigation will be archived.</p>
+      <div class="reset-mission-actions">
+        <button id="confirm-reset-mission" class="primary-button" type="button">START NEW INVESTIGATION</button>
+        <button id="cancel-reset-mission" class="secondary-button" type="button">CANCEL</button>
+      </div>
+    </dialog>
 
     <audio id="audio-context" preload="none"></audio>
     <script type="module" src="./app.js"></script>

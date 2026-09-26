@@ -13,6 +13,7 @@ const hangmanPanel = document.getElementById('hangman-panel');
 const finalAnswerPanel = document.getElementById('final-answer-panel');
 const reportPanel = document.getElementById('report-panel');
 const eventStream = document.getElementById('event-stream');
+const sessionHistory = document.getElementById('session-history');
 
 function readState() {
   try {
@@ -72,6 +73,131 @@ function renderAdmin() {
   eventStream.innerHTML = (state.eventLog || []).slice(0, 60).map((event) => `
     <div>${new Date(event.time).toLocaleTimeString()} — ${event.type}</div>
   `).join('');
+
+  void renderRemoteSessionHistory();
+}
+
+function renderLocalSessionHistory(message = 'Remote session history is unavailable.') {
+  sessionHistory.replaceChildren();
+  let sessionIds = [];
+  try {
+    sessionIds = JSON.parse(localStorage.getItem('agent-prism-mission-state-v1:session-index') || '[]');
+  } catch (error) {
+    sessionHistory.textContent = message;
+    return;
+  }
+
+  const sessions = sessionIds.slice().reverse().map((id, index) => {
+    try {
+      return { id, state: JSON.parse(localStorage.getItem(`agent-prism-mission-state-v1:session:${id}`) || 'null'), number: sessionIds.length - index };
+    } catch (error) {
+      return null;
+    }
+  }).filter((session) => session?.state);
+
+  if (message) {
+    const status = document.createElement('p');
+    status.textContent = message;
+    sessionHistory.append(status);
+  }
+  if (!sessions.length) {
+    sessionHistory.textContent = message || 'No mission sessions recorded in this browser.';
+    return;
+  }
+
+  for (const session of sessions) {
+    const details = document.createElement('details');
+    details.className = 'session-history__item';
+    const summary = document.createElement('summary');
+    const status = session.state.defs?.finalCompletedAt ? 'COMPLETED' : session.state.scene === 'boot' ? 'ACTIVE' : 'IN PROGRESS';
+    summary.textContent = `SESSION ${session.number} [${session.id.slice(0, 8)}] | ${new Date(session.state.createdAt).toLocaleString()} | ${status} | ${session.state.scene}`;
+    details.append(summary);
+
+    const events = document.createElement('ol');
+    events.className = 'session-history__events';
+    for (const event of (session.state.eventLog || []).slice().reverse()) {
+      const item = document.createElement('li');
+      const payload = event.payload || {};
+      const detail = payload.guessText ? `: ${payload.guessText}` : payload.selectedLetter ? `: ${payload.selectedLetter}` : '';
+      item.textContent = `${new Date(event.time).toLocaleTimeString()} — ${event.type}${detail}`;
+      events.append(item);
+    }
+    if (!events.children.length) {
+      const item = document.createElement('li');
+      item.textContent = 'No events recorded.';
+      events.append(item);
+    }
+    details.append(events);
+    sessionHistory.append(details);
+  }
+}
+
+async function renderRemoteSessionHistory() {
+  sessionHistory.replaceChildren();
+  if (!supabase) {
+    renderLocalSessionHistory();
+    return;
+  }
+
+  const { data: missions, error: missionError } = await supabase
+    .from('missions')
+    .select('id, created_at, updated_at, status, current_scene, completed_at')
+    .order('created_at', { ascending: false })
+    .limit(100);
+
+  if (missionError) {
+    renderLocalSessionHistory('Remote session history could not be loaded; showing sessions saved in this browser.');
+    return;
+  }
+
+  if (!missions?.length) {
+    renderLocalSessionHistory('No remote mission sessions recorded yet; showing sessions saved in this browser.');
+    return;
+  }
+
+  const missionIds = missions.map((mission) => mission.id);
+  const { data: events, error: eventError } = await supabase
+    .from('mission_events')
+    .select('mission_id, event_type, event_data, created_at')
+    .in('mission_id', missionIds)
+    .order('created_at', { ascending: true });
+
+  if (eventError) {
+    renderLocalSessionHistory('Remote events could not be loaded; showing sessions saved in this browser.');
+    return;
+  }
+
+  const eventsByMission = new Map();
+  for (const event of events || []) {
+    const missionEvents = eventsByMission.get(event.mission_id) || [];
+    missionEvents.push(event);
+    eventsByMission.set(event.mission_id, missionEvents);
+  }
+
+  for (const [index, mission] of missions.entries()) {
+    const details = document.createElement('details');
+    details.className = 'session-history__item';
+    const summary = document.createElement('summary');
+    summary.textContent = `SESSION ${missions.length - index} [${mission.id.slice(0, 8)}] | ${new Date(mission.created_at).toLocaleString()} | ${mission.status.toUpperCase()} | ${mission.current_scene}`;
+    details.append(summary);
+
+    const eventList = document.createElement('ol');
+    eventList.className = 'session-history__events';
+    for (const event of eventsByMission.get(mission.id) || []) {
+      const item = document.createElement('li');
+      const payload = event.event_data || {};
+      const detail = payload.guessText ? `: ${payload.guessText}` : payload.selectedLetter ? `: ${payload.selectedLetter}` : '';
+      item.textContent = `${new Date(event.created_at).toLocaleTimeString()} — ${event.event_type}${detail}`;
+      eventList.append(item);
+    }
+    if (!eventList.children.length) {
+      const item = document.createElement('li');
+      item.textContent = 'No events recorded.';
+      eventList.append(item);
+    }
+    details.append(eventList);
+    sessionHistory.append(details);
+  }
 }
 
 function setAuthenticated(boolean) {
