@@ -1,5 +1,5 @@
 import { supabase } from './supabase-client.js';
-import { MISSION_ANSWER, HINTS, normalizeText, isCorrectGuess, isPartialGuess, getGuessOutcome, getNoScale, getNoReaction, getHangmanWordState, revealLettersForGuess, createHangmanState } from '../lib/missionLogic.js';
+import { MISSION_ANSWER, HINTS, normalizeText, isCorrectGuess, isPartialGuess, getGuessOutcome, getNoScale, getNoReaction, getHangmanWordState, revealLettersForGuess, createHangmanState } from './lib/missionLogic.js';
 
 const STORAGE_KEY = 'agent-prism-mission-state-v1';
 const HIDDEN_HANGMAN_THRESHOLD = 10;

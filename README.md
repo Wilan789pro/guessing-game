@@ -23,6 +23,20 @@ Open http://localhost:3000/admin and use the access code:
 
 This is a development-safe admin route for monitoring the mission state.
 
+## GitHub Pages
+
+The repository deploys the static site to `https://wilan789pro.github.io/guessing-game/` through `.github/workflows/pages.yml` whenever `main` is updated.
+
+In the repository settings, set **Pages → Build and deployment → Source** to **GitHub Actions**. Add these repository variables under **Settings → Secrets and variables → Actions → Variables**:
+
+- `SUPABASE_URL`
+- `SUPABASE_ANON_KEY`
+- `PUBLIC_APP_NAME` (optional; defaults to `Agent Prism Mission`)
+
+`SUPABASE_ANON_KEY` is a public client key, not a service-role key. Never add a service-role key to repository variables or the browser app. If the Supabase variables are omitted, the static site still builds and uses local browser storage, but remote database sync is unavailable.
+
+To check the static artifact locally, run `npm run build:pages` and serve the generated `dist` directory with any static HTTP server. The build preserves relative URLs so the project site works below `/guessing-game/`.
+
 ## Supabase
 
 The project includes a SQL migration in `supabase/001_create_mission_schema.sql`.

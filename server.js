@@ -13,13 +13,17 @@ const desiredPort = Number(process.env.PORT || 3000);
 app.use(express.json());
 app.use('/lib', express.static(path.join(__dirname, 'lib')));
 
-app.get('/api/config', (_req, res) => {
-  res.json({
+function getPublicConfig() {
+  return {
     appName: process.env.PUBLIC_APP_NAME || 'Agent Prism Mission',
     supabaseUrl: process.env.SUPABASE_URL || '',
     supabaseAnonKey: process.env.SUPABASE_ANON_KEY || '',
     hasSupabase: Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY),
-  });
+  };
+}
+
+app.get(['/api/config', '/config.json'], (_req, res) => {
+  res.json(getPublicConfig());
 });
 
 app.get('/api/health', (_req, res) => {
