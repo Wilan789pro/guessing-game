@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Lama Command Center</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="admin-body">
+    <div class="scanlines"></div>
+    <div class="admin-shell">
+      <header class="admin-header">
+        <div>
+          <div class="badge badge--red">COMMAND CENTER</div>
+          <h1>AGENT LAMA // MISSION MONITOR</h1>
+        </div>
+        <button id="reset-test-mission" class="danger-button" type="button">RESET TEST MISSION</button>
+      </header>
+
+      <section class="admin-login hidden" id="admin-login-panel">
+        <h2>AUTHENTICATION REQUIRED</h2>
+        <label>
+          <span>Access code</span>
+          <input id="admin-code" type="password" placeholder="Enter access code" />
+        </label>
+        <button id="admin-login" class="primary-button" type="button">ACCESS COMMAND CENTER</button>
+      </section>
+
+      <section id="admin-content" class="admin-content hidden">
+        <div class="admin-grid">
+          <article class="panel">
+            <h3>MISSION STATUS</h3>
+            <div id="mission-status" class="stat-list"></div>
+          </article>
+
+          <article class="panel">
+            <h3>ACCEPTANCE</h3>
+            <div id="acceptance-panel" class="stat-list"></div>
+          </article>
+
+          <article class="panel">
+            <h3>GUESSING GAME</h3>
+            <div id="guessing-panel" class="stat-list"></div>
+          </article>
+
+          <article class="panel">
+            <h3>HANGMAN</h3>
+            <div id="hangman-panel" class="stat-list"></div>
+          </article>
+
+          <article class="panel">
+            <h3>FINAL ANSWER</h3>
+            <div id="final-answer-panel" class="stat-list"></div>
+          </article>
+
+          <article class="panel">
+            <h3>REPORT</h3>
+            <div id="report-panel" class="stat-list"></div>
+          </article>
+        </div>
+
+        <article class="panel event-stream-panel">
+          <h3>EVENT STREAM</h3>
+          <div id="event-stream" class="event-stream"></div>
+        </article>
+      </section>
+    </div>
+
+    <script type="module" src="/admin.js"></script>
+  </body>
+</html>
